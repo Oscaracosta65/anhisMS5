@@ -1,0 +1,864 @@
+<?php
+/**
+ * LottoExpert.net — Results + Number Insights (Pick-5 style tables)
+ * SKAI Branded • Joomla 5.1.x + PHP 8.x — content-context safe (no <html>/<head>/<body>)
+ *
+ * Upgrades (CHG):
+ * - Pulls MAIN_MAX from public_html/lottery_skip_config.json (single source of truth)
+ * - Defaults to 39 for your 5/39 lotteries if config missing
+ * - Range typography uses &nbsp;&ndash;&nbsp; to prevent "139" display issues
+ * - SKAI voice copy (calm, descriptive)
+ * - White-on-dark headers enforced
+ * - Preserves existing behavior, links, favorites, and {loadposition Pick5Wheels}
+ */
+
+defined('_JEXEC') or die;
+
+use Joomla\CMS\Factory;
+use Joomla\CMS\Uri\Uri;
+use Joomla\CMS\Session\Session;
+use Joomla\CMS\HTML\HTMLHelper;
+
+$app   = Factory::getApplication();
+$doc   = Factory::getDocument();
+$input = $app->input;
+$db    = Factory::getDbo();
+$user  = Factory::getUser();
+
+// Upstream vars expected (fallbacks)
+$stateName  = isset($stateName) ? (string) $stateName : '';
+$stateAbrev = isset($stateAbrev) ? (string) $stateAbrev : '';
+$gName      = isset($gName) ? (string) $gName : '';
+$dbCol      = isset($dbCol) ? (string) $dbCol : '';
+$gId        = isset($gId) ? (string) $gId : '';
+
+// If upstream gId is missing, try request values
+if ($gId === '') {
+    $gId = $input->getString('gameId', $input->getString('game_id', ''));
+}
+
+// ------------------------------------------------------------
+// SEO + META (Document API)
+// ------------------------------------------------------------
+$uri = Uri::getInstance();
+$canonicalNoQuery = $uri->toString(['scheme', 'host', 'port', 'path']);
+$doc->addCustomTag('<link rel="canonical" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+$doc->addCustomTag('<link rel="alternate" hreflang="en" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+$doc->addCustomTag('<link rel="alternate" hreflang="x-default" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+
+if ($stateName !== '' && $gName !== '') {
+    $doc->setTitle('Results & Number Insights — ' . $stateName . ' • ' . $gName . ' | LottoExpert.net');
+}
+
+// ------------------------------------------------------------
+// Preserve legacy session/phone behavior (modernized)
+// ------------------------------------------------------------
+$loginStatus = (int) ($user->guest ?? 1);
+
+if ($loginStatus === 1) {
+    $session      = Factory::getSession();
+    $user_Session = $session->getId();
+} else {
+    $userId = (int) ($user->id ?? 0);
+
+    $q = $db->getQuery(true)
+        ->select($db->quoteName('profile_value'))
+        ->from($db->quoteName('#__user_profiles'))
+        ->where($db->quoteName('profile_key') . ' = ' . $db->quote('profile.phone'))
+        ->where($db->quoteName('user_id') . ' = ' . (int) $userId);
+
+    $db->setQuery($q);
+    $userPhone = (string) $db->loadResult();
+
+    if ($userPhone !== '') {
+        $userPhone = str_replace('"', '', $userPhone);
+        $userPhone = str_replace('(', '', $userPhone);
+        $userPhone = str_replace(')', '-', $userPhone);
+    } else {
+        $userPhone = 'NULL';
+    }
+}
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+function leFmtDate(?string $date): string
+{
+    if (!$date) return '';
+    $ts = strtotime($date);
+    return ($ts === false) ? '' : date('m-d-Y', $ts);
+}
+
+function lePad2($v): string
+{
+    $v = trim((string) $v);
+    if ($v === '') return '';
+    if (ctype_digit($v) && (int) $v < 10) return str_pad($v, 2, '0', STR_PAD_LEFT);
+    return $v;
+}
+
+function leResolveLogo(string $stateAbrev, string $gName, string $gameId): array
+{
+    $overrides = [
+        // 'MS5' => '/images/lottodb/us/ms/mississippi-match-5.png',
+    ];
+
+    $stateSlug   = strtolower(trim($stateAbrev));
+    $lotterySlug = strtolower(trim($gName));
+    $lotterySlug = str_replace(' ', '-', $lotterySlug);
+
+    $rel = '';
+    if ($gameId !== '' && isset($overrides[$gameId])) {
+        $rel = (string) $overrides[$gameId];
+    } else {
+        $rel = '/images/lottodb/us/' . $stateSlug . '/' . $lotterySlug . '.png';
+    }
+
+    $abs = rtrim(JPATH_ROOT, DIRECTORY_SEPARATOR) . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+    if ($rel !== '' && is_file($abs)) {
+        return ['url' => $rel, 'exists' => true];
+    }
+
+    return ['url' => '', 'exists' => false];
+}
+
+function leFetchDraws(\Joomla\Database\DatabaseDriver $db, string $dbCol, string $gameId, int $limit): array
+{
+    if ($dbCol === '' || $gameId === '' || $limit <= 0) return [];
+
+    $q = $db->getQuery(true)
+        ->select([
+            $db->quoteName('draw_date'),
+            $db->quoteName('next_draw_date'),
+            $db->quoteName('next_jackpot'),
+            $db->quoteName('first'),
+            $db->quoteName('second'),
+            $db->quoteName('third'),
+            $db->quoteName('fourth'),
+            $db->quoteName('fifth'),
+            $db->quoteName('sixth'),
+        ])
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->order($db->quoteName('draw_date') . ' DESC');
+
+    $db->setQuery($q, 0, $limit);
+    $rows = $db->loadAssocList();
+    return is_array($rows) ? $rows : [];
+}
+
+function leInitRange(int $min, int $max): array
+{
+    $counts = [];
+    $seenIdx = [];
+    for ($i = $min; $i <= $max; $i++) {
+        $k = ($i < 10) ? '0' . $i : (string) $i;
+        $counts[$k] = 0;
+        $seenIdx[$k] = null;
+    }
+    return [$counts, $seenIdx];
+}
+
+function leDrawingsAgoLabel(?int $idx, int $window): array
+{
+    if ($idx === null) return [0, "Not in last {$window} drws"];
+    if ($idx === 0) return [1, "In last drw"];
+    return [$idx + 1, ($idx + 1) . " drws ago"];
+}
+
+function leComputeCounts(array $rows, int $min, int $max): array
+{
+    [$counts, $seen] = leInitRange($min, $max);
+
+    foreach ($rows as $idx => $r) {
+        $balls = [
+            trim((string)($r['first'] ?? '')),
+            trim((string)($r['second'] ?? '')),
+            trim((string)($r['third'] ?? '')),
+            trim((string)($r['fourth'] ?? '')),
+            trim((string)($r['fifth'] ?? '')),
+        ];
+        foreach ($balls as $b) {
+            if ($b === '') continue;
+            if (!isset($counts[$b])) continue;
+            $counts[$b]++;
+            if ($seen[$b] === null) $seen[$b] = (int) $idx;
+        }
+    }
+
+    return [$counts, $seen];
+}
+
+// ------------------------------------------------------------
+// JSON Config Loader (public_html/lottery_skip_config.json)
+// ------------------------------------------------------------
+$SKAI_CONFIG_JSON_PATH = JPATH_ROOT . '/lottery_skip_config.json';
+
+// Fallback default for your 5/39 lotteries
+$maxMainBall = 39;
+
+$candidatePaths = array();
+if (is_string($SKAI_CONFIG_JSON_PATH) && $SKAI_CONFIG_JSON_PATH !== '') { $candidatePaths[] = $SKAI_CONFIG_JSON_PATH; }
+$candidatePaths[] = JPATH_ROOT . '/lottery_skip_config.json';
+$candidatePaths[] = JPATH_ROOT . '/media/lottoexpert/config/lottery_skip_config.json';
+$candidatePaths[] = JPATH_ROOT . '/media/lottoexpert/config/skip_config.json';
+$candidatePaths[] = JPATH_ROOT . '/media/lottoexpert/skip_config.json';
+$candidatePaths[] = JPATH_ROOT . '/skip_config.json';
+$candidatePaths[] = JPATH_ROOT . '/skai/skip_config.json';
+
+$cfg = null;
+foreach ($candidatePaths as $p) {
+    if (is_string($p) && $p !== '' && is_file($p) && is_readable($p)) {
+        $raw = file_get_contents($p);
+        if (is_string($raw) && $raw !== '') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded) && isset($decoded['lotteries']) && is_array($decoded['lotteries'])) {
+                $cfg = $decoded;
+                break;
+            }
+        }
+    }
+}
+
+if (is_array($cfg) && isset($cfg['lotteries']) && is_array($cfg['lotteries'])) {
+    $tryIds = array();
+    if ($gId !== '') { $tryIds[] = (string) $gId; }
+
+    $altId = (string) $input->getString('gameId', $input->getString('game_id', ''));
+    if ($altId !== '' && $altId !== (string)$gId) { $tryIds[] = $altId; }
+
+    foreach ($tryIds as $idTry) {
+        if (isset($cfg['lotteries'][$idTry]['lotteryConfig']['max_main_ball_number'])) {
+            $v = (int) $cfg['lotteries'][$idTry]['lotteryConfig']['max_main_ball_number'];
+            if ($v > 0 && $v < 500) { $maxMainBall = $v; break; }
+        }
+    }
+}
+
+// ------------------------------------------------------------
+// Game number ranges (now config-driven)
+// ------------------------------------------------------------
+$MAIN_MIN = 1;
+$MAIN_MAX = (int) $maxMainBall;
+if ($MAIN_MAX < 5) { $MAIN_MAX = 39; } // safety fallback
+
+// ------------------------------------------------------------
+// Inputs: N + Back X (for chart “earlier window”)
+// ------------------------------------------------------------
+$MIN_N = 10;
+$MAX_N = 2000;
+$MIN_BACK = 0;
+$MAX_BACK = 5000;
+
+$nod  = 100;
+$back = 0;
+
+if ($input->getMethod() === 'POST' && Session::checkToken()) {
+    if ($input->post->get('fq-search', null, 'cmd') !== null) {
+        $nod  = (int) $input->post->get('nod', 100, 'int');
+        $back = (int) $input->post->get('back', 0, 'int');
+    }
+}
+$nod  = max($MIN_N, min($MAX_N, $nod));
+$back = max($MIN_BACK, min($MAX_BACK, $back));
+
+// ------------------------------------------------------------
+// Data fetch
+// ------------------------------------------------------------
+$logo = leResolveLogo($stateAbrev, $gName, $gId);
+
+$latestRow = null;
+$rows100   = [];
+$rowsN     = [];
+$rowsBackN = [];
+
+try {
+    $latest = leFetchDraws($db, $dbCol, $gId, 1);
+    if (!empty($latest)) $latestRow = $latest[0];
+
+    $rows100 = leFetchDraws($db, $dbCol, $gId, 100);
+    $rowsN   = ($nod === 100) ? $rows100 : leFetchDraws($db, $dbCol, $gId, $nod);
+
+    // Earlier window: fetch (back + nod) then slice
+    $need = $back + $nod;
+    $tmp  = leFetchDraws($db, $dbCol, $gId, $need);
+    $rowsBackN = !empty($tmp) ? array_slice($tmp, $back, $nod) : [];
+} catch (\Throwable $e) {
+    $latestRow = null;
+    $rows100 = $rowsN = $rowsBackN = [];
+}
+
+// Latest fields
+$draw_date      = $latestRow ? (string) ($latestRow['draw_date'] ?? '') : '';
+$next_draw_date = $latestRow ? (string) ($latestRow['next_draw_date'] ?? '') : '';
+$next_jackpot   = $latestRow ? (string) ($latestRow['next_jackpot'] ?? '') : '';
+
+$p1 = $latestRow ? lePad2($latestRow['first']  ?? '') : '';
+$p2 = $latestRow ? lePad2($latestRow['second'] ?? '') : '';
+$p3 = $latestRow ? lePad2($latestRow['third']  ?? '') : '';
+$p4 = $latestRow ? lePad2($latestRow['fourth'] ?? '') : '';
+$p5 = $latestRow ? lePad2($latestRow['fifth']  ?? '') : '';
+$pb = $latestRow ? lePad2($latestRow['sixth']  ?? '') : '';
+
+// Counts
+[$counts100, $seen100]   = leComputeCounts($rows100,   $MAIN_MIN, $MAIN_MAX);
+[$countsN,   $seenN]     = leComputeCounts($rowsN,     $MAIN_MIN, $MAIN_MAX);
+[$countsBack, $seenBack] = leComputeCounts($rowsBackN, $MAIN_MIN, $MAIN_MAX);
+
+// Chart series (full distribution)
+$chartLabels   = [];
+$chartVals100  = [];
+$chartValsBack = [];
+for ($i = $MAIN_MIN; $i <= $MAIN_MAX; $i++) {
+    $k = ($i < 10) ? '0' . $i : (string) $i;
+    $chartLabels[]   = $k;
+    $chartVals100[]  = (int) ($counts100[$k] ?? 0);
+    $chartValsBack[] = (int) ($countsBack[$k] ?? 0);
+}
+
+// Links (kept; add fallback to dynamic game id for generic pages)
+$gameLinks = [
+    'CT2' => [
+        'SKAI Analysis'          => '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=CT2',
+        'AI Powered Predictions' => '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=CT2',
+        'Skip and Hit Analysis'  => '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=CT2',
+        'Heatmap Analysis'       => '/all-lottery-heatmaps?gameId=CT2',
+        'MCMC Analysis'          => '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=CT2',
+    ],
+    'TX2' => [
+        'SKAI Analysis'          => '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=TX2',
+        'AI Powered Predictions' => '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=TX2',
+        'Skip and Hit Analysis'  => '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=TX2',
+        'Heatmap Analysis'       => '/all-lottery-heatmaps?gameId=TX2',
+        'MCMC Analysis'          => '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=TX2',
+    ],
+    'SD1' => [
+        'SKAI Analysis'          => '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=SD1',
+        'AI Powered Predictions' => '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=SD1',
+        'Skip and Hit Analysis'  => '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=SD1',
+        'Heatmap Analysis'       => '/all-lottery-heatmaps?gameId=SD1',
+        'MCMC Analysis'          => '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=SD1',
+    ],
+    'MA3' => [
+        'SKAI Analysis'          => '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=MA3',
+        'AI Powered Predictions' => '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=MA3',
+        'Skip and Hit Analysis'  => '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=MA3',
+        'Heatmap Analysis'       => '/all-lottery-heatmaps?gameId=MA3',
+        'MCMC Analysis'          => '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=MA3',
+    ],
+    'MS5' => [
+        'SKAI Analysis'          => '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=MS5',
+        'AI Powered Predictions' => '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=MS5',
+        'Skip and Hit Analysis'  => '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=MS5',
+        'Heatmap Analysis'       => '/all-lottery-heatmaps?gameId=MS5',
+        'MCMC Analysis'          => '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=MS5',
+    ],
+];
+
+$escapedGid        = htmlspecialchars($gId, ENT_QUOTES, 'UTF-8');
+$escapedStateName  = htmlspecialchars($stateName, ENT_QUOTES, 'UTF-8');
+$escapedGname      = htmlspecialchars($gName, ENT_QUOTES, 'UTF-8');
+$escapedStateAbrev = htmlspecialchars(strtolower($stateAbrev), ENT_QUOTES, 'UTF-8');
+
+?>
+<style>
+:root{
+  --le-ink:#0A1A33;
+  --le-muted:#5F6F8C;
+  --le-surface:#FFFFFF;
+  --le-surface-2:#F6F8FC;
+  --le-border:rgba(10,26,51,.12);
+  --le-radius-18:18px;
+  --le-shadow-1: 0 10px 30px rgba(10,26,51,.12);
+  --le-shadow-2: 0 14px 36px rgba(10,26,51,.16);
+  --le-grad-hero:
+    radial-gradient(1200px 600px at 20% -10%, rgba(28,102,255,.22) 0%, rgba(28,102,255,0) 55%),
+    radial-gradient(900px 520px at 100% 0%, rgba(245,166,35,.16) 0%, rgba(245,166,35,0) 58%),
+    linear-gradient(180deg, #061225 0%, #0A1A33 100%);
+  --le-grad-primary: linear-gradient(135deg, #0A1A33 0%, #1C66FF 100%);
+  --le-grad-soft: linear-gradient(180deg, #F6F8FC 0%, #FFFFFF 100%);
+  --le-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+*{box-sizing:border-box}
+.le-wrap{max-width:1120px;margin:0 auto;padding:18px 12px 10px;font-family:var(--le-font);color:var(--le-ink);}
+
+/* HERO */
+.le-hero{border:1px solid rgba(255,255,255,.10);background:var(--le-grad-hero);color:#fff;border-radius:var(--le-radius-18);padding:18px 16px;box-shadow:var(--le-shadow-2);overflow:hidden}
+.le-hero,.le-hero *{color:#fff !important}
+.le-hero-row{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+.le-hero-logo{width:96px;height:96px;border-radius:16px;background:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.30);display:flex;align-items:center;justify-content:center;overflow:hidden;flex:0 0 auto;box-shadow:0 10px 24px rgba(0,0,0,.22);padding:10px}
+.le-hero-logo img{width:100%;height:100%;object-fit:contain;display:block}
+.le-hero-main{min-width:280px;flex:1 1 360px}
+.le-kicker{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:rgba(255,255,255,.82);margin:2px 0 6px}
+.le-title{margin:0;font-size:24px;line-height:1.15;font-weight:950}
+.le-sub{margin:8px 0 0;color:rgba(255,255,255,.90);font-size:14px;line-height:1.6;max-width:86ch}
+
+/* TOOL BUTTONS */
+.le-tools{margin-top:14px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+@media (max-width:900px){ .le-tools{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@media (max-width:560px){ .le-tools{grid-template-columns:1fr} }
+.le-btn{display:inline-flex;align-items:center;justify-content:center;width:100%;padding:12px 14px;border-radius:14px;font-weight:950;text-decoration:none;background:var(--le-grad-primary);border:1px solid rgba(255,255,255,.16);color:#fff !important;box-shadow:0 10px 24px rgba(0,0,0,.18);transition:transform .14s ease, box-shadow .14s ease, filter .14s ease}
+.le-btn:hover{transform:translateY(-1px);box-shadow:0 14px 30px rgba(0,0,0,.24);filter:brightness(1.04)}
+.le-btn:focus,.le-btn:focus-visible{outline:3px solid rgba(255,255,255,.28);outline-offset:3px}
+
+/* CARDS */
+.le-card{margin-top:14px;background:var(--le-grad-soft);border:1px solid var(--le-border);border-radius:var(--le-radius-18);box-shadow:var(--le-shadow-1);overflow:hidden}
+.le-card-head{padding:12px 14px;text-align:center;font-weight:950;font-size:18px;background:linear-gradient(135deg, rgba(10,26,51,.96) 0%, rgba(28,102,255,.92) 100%);text-shadow:0 1px 2px rgba(0,0,0,.28);color:#fff !important}
+.le-card-head,.le-card-head *{color:#fff !important}
+.le-card-body{padding:12px 12px 14px;background:#fff}
+
+/* META */
+.le-meta{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:10px 0 6px}
+.le-meta-item{background:var(--le-surface-2);border:1px solid var(--le-border);border-radius:12px;padding:8px 10px;min-width:210px;text-align:center}
+.le-meta-label{display:block;font-size:12px;color:var(--le-muted);font-weight:800}
+.le-meta-value{display:block;margin-top:4px;font-size:16px;font-weight:950;color:var(--le-ink)}
+
+/* BALLS */
+.le-balls{text-align:center;padding:8px 0 2px}
+.le-ball{position:relative;display:inline-flex;align-items:center;justify-content:center;margin:0 3px 8px;width:36px;height:36px;border-radius:50%;font-weight:950;font-size:15px;background:linear-gradient(180deg,#FFFFFF 0%,#F2F6FF 100%);color:var(--le-ink);border:1px solid rgba(10,26,51,.18);box-shadow:0 10px 20px rgba(10,26,51,.10), inset 0 1px 0 rgba(255,255,255,.75)}
+.le-ball:after{content:"";position:absolute;width:32px;height:5px;bottom:-8%;left:50%;transform:translate(-50%);border-radius:50%;background:radial-gradient(ellipse at center, rgba(51,51,51,.45) 0, rgba(51,51,51,0) 75%)}
+
+/* DRAW HISTORY */
+.drawHistory{margin-top:14px;padding:14px;border:1px solid var(--le-border);background:var(--le-surface-2);border-radius:14px;border-top:6px solid rgba(10,26,51,.30)}
+.drawHistory h2{margin:0 0 8px;font-size:16px;font-weight:950}
+
+/* QUICK GUIDE */
+.le-insight{margin-top:16px;background:#fff;border:1px solid var(--le-border);border-radius:var(--le-radius-18);box-shadow:var(--le-shadow-1);overflow:hidden}
+.le-insight-head{padding:12px 14px;background:linear-gradient(135deg, rgba(28,102,255,.10) 0%, rgba(10,26,51,.04) 100%);border-bottom:1px solid var(--le-border);font-weight:950;color:var(--le-ink)}
+.le-insight-body{padding:12px 14px 14px;color:var(--le-ink);font-size:13px;line-height:1.7}
+.le-insight-body ul{list-style:none;padding:0;margin:10px 0 0}
+.le-insight-body li{margin:7px 0;padding-left:18px;position:relative}
+.le-insight-body li:before{content:"";width:8px;height:8px;border-radius:999px;background:rgba(28,102,255,.55);position:absolute;left:0;top:9px}
+
+/* CONTROLS */
+.le-controls{padding:12px 12px 10px;background:#fff;border-bottom:1px solid rgba(10,26,51,.06)}
+.le-controls .row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;justify-content:center}
+.le-field{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.le-controls label{font-weight:900;color:var(--le-ink);font-size:13px}
+.le-help{font-size:12px;color:var(--le-muted);font-weight:800;max-width:620px;line-height:1.4}
+.le-num{width:180px;padding:9px 10px;border-radius:12px;border:1px solid var(--le-border);background:#fff;color:var(--le-ink);font-weight:950}
+.le-num:focus,.le-num:focus-visible{outline:3px solid rgba(28,102,255,.22);outline-offset:3px}
+.le-submit{padding:11px 16px;min-width:180px;border-radius:12px;border:1px solid rgba(10,26,51,.22);background:var(--le-ink);color:#fff !important;font-weight:950;cursor:pointer}
+.le-submit:focus,.le-submit:focus-visible{outline:3px solid rgba(28,102,255,.30);outline-offset:3px}
+
+/* TABLES */
+table.sortable{width:100%;background:#fff;border:1px solid var(--le-border);border-radius:14px;overflow:hidden;box-shadow:0 8px 20px rgba(10,26,51,.06);border-collapse:separate;border-spacing:0}
+table.sortable thead th{background:linear-gradient(180deg,#0A1A33 0%,#071427 100%) !important;color:#fff !important;font-weight:950;padding:10px 6px;text-shadow:0 1px 2px rgba(0,0,0,.28)}
+table.sortable thead th *{color:#fff !important}
+table.sortable th:not(.sorttable_sorted):not(.sorttable_sorted_reverse):not(.sorttable_nosort):after{content:" \25B4\25BE";opacity:.88;color:#fff !important}
+table.sortable td{padding:9px 6px;text-align:center;border-bottom:1px solid rgba(10,26,51,.06);color:var(--le-ink)}
+table.sortable tbody tr:hover{background:rgba(32,201,151,.12)}
+.le-pill{position:relative;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;font-weight:950;background:linear-gradient(180deg,#FFFFFF 0%,#F2F6FF 100%);color:var(--le-ink);border:1px solid rgba(10,26,51,.18);box-shadow:0 8px 16px rgba(10,26,51,.10), inset 0 1px 0 rgba(255,255,255,.75)}
+.le-pill:after{content:"";position:absolute;width:28px;height:5px;bottom:-10%;left:50%;transform:translate(-50%);border-radius:50%;background:radial-gradient(ellipse at center, rgba(51,51,51,.40) 0, rgba(51,51,51,0) 75%)}
+
+/* CHART */
+.le-chart-card{margin-top:14px;background:#fff;border:1px solid var(--le-border);border-radius:var(--le-radius-18);box-shadow:var(--le-shadow-1);overflow:hidden}
+.le-chart-head{padding:12px 14px;font-weight:950;color:#fff !important;text-shadow:0 1px 2px rgba(0,0,0,.28);background:linear-gradient(135deg, rgba(6,26,62,.98) 0%, rgba(28,102,255,.92) 100%)}
+.le-chart-head,.le-chart-head *{color:#fff !important}
+.le-chart-sub{display:block;margin-top:4px;font-size:12px;font-weight:900;opacity:.92}
+.le-chart-body{padding:12px 12px 14px}
+.le-chart-frame{width:100%;height:340px;position:relative}
+.le-chart-frame canvas{width:100% !important;height:340px !important}
+.le-toggle{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center;margin-top:10px}
+.le-toggle-label{font-size:12px;font-weight:900;opacity:.95}
+.le-toggle-btn{appearance:none;border:1px solid rgba(255,255,255,.28);background:rgba(255,255,255,.12);color:#fff !important;padding:8px 10px;border-radius:12px;font-weight:950;cursor:pointer;transition:filter .14s ease, transform .14s ease}
+.le-toggle-btn:hover{filter:brightness(1.06);transform:translateY(-1px)}
+.le-toggle-btn[aria-pressed="true"]{background:rgba(255,255,255,.22);border-color:rgba(255,255,255,.50)}
+.le-toggle-btn:focus,.le-toggle-btn:focus-visible{outline:3px solid rgba(255,255,255,.25);outline-offset:3px}
+
+/* favorites */
+#fq-fav-container{margin:10px 0 0;display:block;padding:10px;border-radius:14px;border:1px solid var(--le-border);background:var(--le-grad-soft)}
+#fq-fav-container strong{font-size:14px}
+input[type="checkbox"]{transform:scale(1.3);cursor:pointer}
+
+@media (prefers-reduced-motion: reduce){ .le-btn,.le-toggle-btn{transition:none} }
+</style>
+
+<div class="le-wrap">
+
+  <!-- HERO -->
+  <div class="le-hero" role="region" aria-label="Lottery overview">
+    <div class="le-hero-row">
+      <div class="le-hero-logo" aria-hidden="<?php echo ($logo['exists'] ? 'false' : 'true'); ?>">
+        <?php if ($logo['exists'] && $logo['url'] !== '') : ?>
+          <img
+            src="<?php echo htmlspecialchars($logo['url'], ENT_QUOTES, 'UTF-8'); ?>"
+            alt="<?php echo htmlspecialchars(trim($stateName . ' ' . $gName), ENT_QUOTES, 'UTF-8'); ?>"
+            width="96" height="96" loading="lazy" decoding="async">
+        <?php else : ?>
+          <svg width="42" height="42" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2l2.7 6.2L21 9l-4.7 4.1L17.6 21 12 17.8 6.4 21l1.3-7.9L3 9l6.3-.8L12 2z"
+                  stroke="rgba(10,26,51,.55)" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+        <?php endif; ?>
+      </div>
+
+      <div class="le-hero-main">
+        <div class="le-kicker">Results Hub • Calm, clear historical context</div>
+        <h1 class="le-title"><?php echo htmlspecialchars($stateName, ENT_QUOTES, 'UTF-8'); ?> • <?php echo htmlspecialchars($gName, ENT_QUOTES, 'UTF-8'); ?></h1>
+        <p class="le-sub">
+          Review the latest draw, then explore how often each number appears across
+          <strong><?php echo (int)$MAIN_MIN; ?>&nbsp;&ndash;&nbsp;<?php echo (int)$MAIN_MAX; ?></strong>.
+          Use a recent window, and optionally compare an earlier slice of history to see how activity shifts.
+        </p>
+      </div>
+    </div>
+
+    <div class="le-tools" aria-label="Analysis tools">
+      <?php
+      if (isset($gameLinks[$gId])) {
+          foreach ($gameLinks[$gId] as $label => $url) {
+              echo '<a class="le-btn" href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . '</a>';
+          }
+      } else {
+          // Safe fallback for any other game IDs
+          echo '<a class="le-btn" href="/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=' . rawurlencode($gId) . '">SKAI Analysis</a>';
+          echo '<a class="le-btn" href="/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=' . rawurlencode($gId) . '">AI Predictions</a>';
+          echo '<a class="le-btn" href="/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=' . rawurlencode($gId) . '">Skip &amp; Hit Analysis</a>';
+      }
+      ?>
+      <a class="le-btn" href="/lowest-drawn-number-analysis?gId=<?php echo $escapedGid; ?>&stateName=<?php echo $escapedStateName; ?>&gName=<?php echo $escapedGname; ?>&sTn=<?php echo $escapedStateAbrev; ?>">Lowest Number Analysis</a>
+      <a class="le-btn" href="/lottery-archives-pick5?gId=<?php echo $escapedGid; ?>&stateName=<?php echo $escapedStateName; ?>&gName=<?php echo $escapedGname; ?>&sTn=<?php echo $escapedStateAbrev; ?>">Lottery Archives</a>
+    </div>
+  </div>
+
+  <!-- LATEST RESULTS -->
+  <div class="le-card" role="region" aria-label="Latest results">
+    <div class="le-card-head"><?php echo htmlspecialchars($stateName . ' ' . $gName, ENT_QUOTES, 'UTF-8'); ?> — Latest Results</div>
+    <div class="le-card-body">
+      <?php if ($latestRow) : ?>
+        <div class="le-meta" aria-label="Draw dates">
+          <div class="le-meta-item">
+            <span class="le-meta-label">Draw date</span>
+            <span class="le-meta-value"><?php echo htmlspecialchars(leFmtDate($draw_date), ENT_QUOTES, 'UTF-8'); ?></span>
+          </div>
+          <div class="le-meta-item">
+            <span class="le-meta-label">Next draw</span>
+            <span class="le-meta-value"><?php echo htmlspecialchars(leFmtDate($next_draw_date), ENT_QUOTES, 'UTF-8'); ?></span>
+          </div>
+        </div>
+
+        <div class="le-balls" aria-label="Drawn numbers">
+          <span class="le-ball"><?php echo htmlspecialchars($p1, ENT_QUOTES, 'UTF-8'); ?></span>
+          <span class="le-ball"><?php echo htmlspecialchars($p2, ENT_QUOTES, 'UTF-8'); ?></span>
+          <span class="le-ball"><?php echo htmlspecialchars($p3, ENT_QUOTES, 'UTF-8'); ?></span>
+          <span class="le-ball"><?php echo htmlspecialchars($p4, ENT_QUOTES, 'UTF-8'); ?></span>
+          <span class="le-ball"><?php echo htmlspecialchars($p5, ENT_QUOTES, 'UTF-8'); ?></span>
+        </div>
+
+        <?php
+        $jackpotNum = (is_numeric($next_jackpot) ? (float) $next_jackpot : 0.0);
+        $hasJackpot = ($jackpotNum > 0 && strtolower((string)$next_jackpot) !== 'n/a');
+        ?>
+        <?php if ($hasJackpot) : ?>
+          <div class="le-meta" aria-label="Jackpot">
+            <div class="le-meta-item" style="min-width:340px;">
+              <span class="le-meta-label">Next jackpot</span>
+              <span class="le-meta-value">$<?php echo htmlspecialchars(number_format($jackpotNum, 0, '.', ','), ENT_QUOTES, 'UTF-8'); ?></span>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <div class="drawHistory">
+          <h2>When these numbers last appeared</h2>
+          <?php
+          $nums = [$p1, $p2, $p3, $p4, $p5];
+
+          foreach ($nums as $nVal) {
+              $nVal = trim((string)$nVal);
+              if ($nVal === '' || $draw_date === '') continue;
+
+              $q = $db->getQuery(true)
+                  ->select('MAX(' . $db->quoteName('draw_date') . ')')
+                  ->from($db->quoteName($dbCol))
+                  ->where($db->quoteName('game_id') . ' = ' . $db->quote($gId))
+                  ->where($db->quoteName('draw_date') . ' < ' . $db->quote($draw_date))
+                  ->where('(' .
+                      $db->quoteName('first')  . ' = ' . $db->quote($nVal) . ' OR ' .
+                      $db->quoteName('second') . ' = ' . $db->quote($nVal) . ' OR ' .
+                      $db->quoteName('third')  . ' = ' . $db->quote($nVal) . ' OR ' .
+                      $db->quoteName('fourth') . ' = ' . $db->quote($nVal) . ' OR ' .
+                      $db->quoteName('fifth')  . ' = ' . $db->quote($nVal) .
+                  ')');
+
+              $db->setQuery($q);
+              $lastDraw = (string) $db->loadResult();
+
+              if ($lastDraw !== '') {
+                  $q2 = $db->getQuery(true)
+                      ->select('COUNT(' . $db->quoteName('id') . ')')
+                      ->from($db->quoteName($dbCol))
+                      ->where($db->quoteName('game_id') . ' = ' . $db->quote($gId))
+                      ->where($db->quoteName('draw_date') . ' > ' . $db->quote($lastDraw))
+                      ->where($db->quoteName('draw_date') . ' < ' . $db->quote($draw_date));
+                  $db->setQuery($q2);
+                  $cnt = (int) $db->loadResult() + 1;
+
+                  echo '<strong>' . htmlspecialchars($nVal, ENT_QUOTES, 'UTF-8') . ':</strong> last seen '
+                      . htmlspecialchars(leFmtDate($lastDraw), ENT_QUOTES, 'UTF-8')
+                      . ' <strong>(' . (int)$cnt . ' draws ago)</strong><br />';
+              } else {
+                  echo '<strong>' . htmlspecialchars($nVal, ENT_QUOTES, 'UTF-8') . ':</strong> not found in earlier records<br />';
+              }
+          }
+          ?>
+        </div>
+
+      <?php else : ?>
+        <div style="padding:10px;text-align:center;color:var(--le-muted);">Latest result could not be loaded right now.</div>
+      <?php endif; ?>
+    </div>
+  </div>
+
+  <!-- QUICK GUIDE -->
+  <div class="le-insight" role="region" aria-label="Quick guide">
+    <div class="le-insight-head">Quick guide</div>
+    <div class="le-insight-body">
+      <ul>
+        <li><strong>Past 100</strong> is a simple baseline view.</li>
+        <li><strong>How many drawings?</strong> zooms in or out for the tables and chart.</li>
+        <li><strong>Go back (optional)</strong> compares an earlier slice: skip the newest <em>X</em> draws, then analyze the next <em>N</em>.</li>
+        <li><strong>Reminder:</strong> This is descriptive history — it does not predict outcomes.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- CONTROLS -->
+  <div class="le-card" role="region" aria-label="Analysis controls">
+    <div class="le-card-head">Customize your view</div>
+
+    <div class="le-controls">
+      <form method="POST"
+            action="/all-us-lotteries/results-analysis?st=<?php echo htmlspecialchars($stateAbrev, ENT_QUOTES, 'UTF-8'); ?>&stn=<?php echo htmlspecialchars($stateName, ENT_QUOTES, 'UTF-8'); ?>&gm=<?php echo htmlspecialchars($gName, ENT_QUOTES, 'UTF-8'); ?>#numbers-frequency">
+        <div class="row">
+          <div class="le-field">
+            <label for="nod">How many drawings?</label>
+            <input class="le-num"
+                   type="number"
+                   id="nod"
+                   name="nod"
+                   min="<?php echo (int)$MIN_N; ?>"
+                   max="<?php echo (int)$MAX_N; ?>"
+                   step="1"
+                   inputmode="numeric"
+                   value="<?php echo (int)$nod; ?>"
+                   aria-describedby="nodHelp"
+                   required>
+            <div class="le-help" id="nodHelp">Bigger windows feel steadier; smaller windows highlight what’s been happening lately.</div>
+          </div>
+
+          <div class="le-field">
+            <label for="back">Go back (optional)</label>
+            <input class="le-num"
+                   type="number"
+                   id="back"
+                   name="back"
+                   min="<?php echo (int)$MIN_BACK; ?>"
+                   max="<?php echo (int)$MAX_BACK; ?>"
+                   step="1"
+                   inputmode="numeric"
+                   value="<?php echo (int)$back; ?>"
+                   aria-describedby="backHelp">
+            <div class="le-help" id="backHelp">For the chart: skip the newest X drawings, then review the next N drawings.</div>
+          </div>
+
+          <input class="le-submit" name="fq-search" type="submit" value="Update analysis">
+          <?php echo HTMLHelper::_('form.token'); ?>
+        </div>
+      </form>
+    </div>
+
+    <div class="le-card-body" style="padding-top:10px;">
+      <div style="text-align:center;color:var(--le-muted);font-weight:800;font-size:12px;">
+        Compare “Past 100” vs your “Earlier window” to see how number activity shifts over time.
+      </div>
+    </div>
+  </div>
+
+  <!-- ONE CHART -->
+  <div class="le-chart-card" role="region" aria-label="Frequency chart">
+    <div class="le-chart-head">
+      Number activity (<?php echo (int)$MAIN_MIN; ?>&nbsp;&ndash;&nbsp;<?php echo (int)$MAIN_MAX; ?>)
+      <span class="le-chart-sub" id="freqChartSubtitle">
+        Showing: Earlier window • Back <?php echo (int)$back; ?> • N=<?php echo (int)$nod; ?> (<?php echo (int)count($rowsBackN); ?> draws available)
+      </span>
+
+      <div class="le-toggle" role="group" aria-label="Chart view toggle">
+        <span class="le-toggle-label">View:</span>
+        <button type="button" class="le-toggle-btn" id="btnChart100" aria-pressed="false">Past 100</button>
+        <button type="button" class="le-toggle-btn" id="btnChartBack" aria-pressed="true">Earlier window</button>
+      </div>
+    </div>
+
+    <div class="le-chart-body">
+      <div class="le-chart-frame">
+        <canvas id="freqChartAll" aria-label="Frequency chart for all numbers" role="img"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- TABLES -->
+  <div class="le-card" role="region" aria-label="Number frequencies">
+    <div class="le-card-head" id="numbers-frequency">Numbers frequency</div>
+
+    <div class="le-card-body">
+      <div style="margin:0 0 10px;color:var(--le-muted);font-weight:800;font-size:12px;line-height:1.5;">
+        Use the tables to spot what’s appeared more often, and what hasn’t shown up recently.
+        (Sort by clicking column headers.)
+      </div>
+
+      <h2 style="margin:0 0 10px;font-size:16px;font-weight:950;color:var(--le-ink);">Past 100 drawings</h2>
+      <table id="table100" class="sortable" aria-label="Past 100 frequency table">
+        <thead>
+          <tr><th>Number</th><th>Drawn Times</th><th>Last Seen</th><th>Fav</th></tr>
+        </thead>
+        <tbody>
+          <?php
+          for ($i = $MAIN_MIN; $i <= $MAIN_MAX; $i++) {
+              $nq = ($i < 10) ? '0' . $i : (string)$i;
+              $count = (int) ($counts100[$nq] ?? 0);
+              [$agoKey, $agoText] = leDrawingsAgoLabel($seen100[$nq] ?? null, 100);
+
+              echo '<tr>';
+              echo '<td><span class="le-pill">' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '</span></td>';
+              echo '<td sorttable_customkey="' . (int)$count . '">' . (int)$count . ' X</td>';
+              echo '<td sorttable_customkey="' . (int)$agoKey . '">' . htmlspecialchars($agoText, ENT_QUOTES, 'UTF-8') . '</td>';
+              echo '<td><input type="checkbox" id="fav100_' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '" name="favonum[]" value="' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '" aria-label="Favorite ' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '"></td>';
+              echo '</tr>';
+          }
+          ?>
+        </tbody>
+      </table>
+
+      <div style="height:14px" aria-hidden="true"></div>
+
+      <h2 style="margin:0 0 10px;font-size:16px;font-weight:950;color:var(--le-ink);">
+        Last <?php echo (int)$nod; ?> drawings
+      </h2>
+      <table id="tableNfreq" class="sortable" aria-label="Last N frequency table">
+        <thead>
+          <tr><th>Number</th><th>Drawn Times</th><th>Last Seen</th><th>Fav</th></tr>
+        </thead>
+        <tbody>
+          <?php
+          for ($i = $MAIN_MIN; $i <= $MAIN_MAX; $i++) {
+              $nq = ($i < 10) ? '0' . $i : (string)$i;
+              $count = (int) ($countsN[$nq] ?? 0);
+              [$agoKey, $agoText] = leDrawingsAgoLabel($seenN[$nq] ?? null, (int)$nod);
+
+              echo '<tr>';
+              echo '<td><span class="le-pill">' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '</span></td>';
+              echo '<td sorttable_customkey="' . (int)$count . '">' . (int)$count . ' X</td>';
+              echo '<td sorttable_customkey="' . (int)$agoKey . '">' . htmlspecialchars($agoText, ENT_QUOTES, 'UTF-8') . '</td>';
+              echo '<td><input type="checkbox" id="favN_' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '" name="favonum[]" value="' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '" aria-label="Favorite ' . htmlspecialchars($nq, ENT_QUOTES, 'UTF-8') . '"></td>';
+              echo '</tr>';
+          }
+          ?>
+        </tbody>
+      </table>
+
+      <div id="fq-fav-container" aria-live="polite"><strong>Favorites Selection:</strong></div>
+
+      <script type="text/javascript">
+      jQuery(document).ready(function() {
+        jQuery('input[name="favonum[]"]').on('change', function () {
+          var inputVal = String(jQuery(this).val() || '') + ' ';
+          var className = inputVal.replace(/ /g, '_');
+
+          if (jQuery(this).prop('checked')) {
+            jQuery("#fq-fav-container").append(
+              '<span class="span_' + className + '" style="display:inline-flex;align-items:center;justify-content:center;margin:0 6px 6px 0;width:40px;height:40px;border-radius:50%;font-weight:950;color:var(--le-ink);background:linear-gradient(180deg,#FFFFFF 0%,#F2F6FF 100%);border:1px solid rgba(10,26,51,.18);box-shadow:0 8px 16px rgba(10,26,51,.10);">' +
+              inputVal +
+              '</span>'
+            );
+          } else {
+            jQuery('.span_' + className).remove();
+          }
+        });
+      });
+      </script>
+
+    </div>
+  </div>
+
+</div>
+
+<script type="text/javascript">
+(function(){
+  var labelsAll = <?php echo json_encode($chartLabels, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>;
+  var data100   = <?php echo json_encode($chartVals100, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>;
+  var dataBack  = <?php echo json_encode($chartValsBack, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>;
+
+  var back = <?php echo (int)$back; ?>;
+  var nod  = <?php echo (int)$nod; ?>;
+
+  function loadChartJsIfNeeded(done){
+    if (window.Chart) { done(); return; }
+    var s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+    s.async = true;
+    s.onload = function(){ done(); };
+    s.onerror = function(){ done(); };
+    document.head.appendChild(s);
+  }
+
+  function setPressed(btnA, btnB, aPressed){
+    if (!btnA || !btnB) return;
+    btnA.setAttribute('aria-pressed', aPressed ? 'true' : 'false');
+    btnB.setAttribute('aria-pressed', aPressed ? 'false' : 'true');
+  }
+
+  function render(){
+    if (!window.Chart) return;
+
+    var canvas = document.getElementById('freqChartAll');
+    if (!canvas) return;
+
+    var subtitleEl = document.getElementById('freqChartSubtitle');
+    var btn100  = document.getElementById('btnChart100');
+    var btnBack = document.getElementById('btnChartBack');
+
+    var activeKey = 'BACK';
+    var chart;
+
+    try {
+      chart = new Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: { labels: labelsAll, datasets: [{ label: 'Drawn Times', data: dataBack, borderWidth: 0 }] },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false }, tooltip: { enabled: true } },
+          scales: {
+            x: { ticks: { autoSkip: true, maxTicksLimit: 14 }, grid: { display: false } },
+            y: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: 'rgba(10,26,51,.08)' } }
+          }
+        }
+      });
+    } catch (e) { return; }
+
+    function applyDataset(key){
+      activeKey = key;
+      chart.data.datasets[0].data = (key === '100') ? data100 : dataBack;
+      chart.update();
+
+      if (subtitleEl) {
+        subtitleEl.textContent = (key === '100')
+          ? 'Showing: Past 100 drawings'
+          : ('Showing: Earlier window • Back ' + String(back) + ' • N=' + String(nod));
+      }
+      setPressed(btn100, btnBack, key === '100');
+    }
+
+    if (btn100)  btn100.addEventListener('click', function(){ if (activeKey !== '100') applyDataset('100'); });
+    if (btnBack) btnBack.addEventListener('click', function(){ if (activeKey !== 'BACK') applyDataset('BACK'); });
+
+    applyDataset('BACK');
+  }
+
+  loadChartJsIfNeeded(function(){
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', render);
+    else render();
+  });
+})();
+</script>
